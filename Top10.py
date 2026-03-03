@@ -4,7 +4,7 @@ import streamlit as st
 from io import BytesIO
 
 st.set_page_config(page_title="按签订单位-年度-客商统计", layout="wide")
-st.title("📊 按签订单位分组：年度客商Top统计（含合同明细折叠）")
+st.title("📊 按签订单位分组：年度客商Top统计（树状明细 + 可导出Excel）")
 
 # =========================
 # Helpers
@@ -28,7 +28,6 @@ def read_csv_safely(uploaded_file) -> pd.DataFrame:
     raise last_err
 
 def to_number_series(s: pd.Series) -> pd.Series:
-    # 去逗号、空格、Tab，强制转数值，异常->NaN
     return pd.to_numeric(
         s.astype(str)
          .str.replace(",", "", regex=False)
@@ -38,14 +37,91 @@ def to_number_series(s: pd.Series) -> pd.Series:
     )
 
 def top_n_by_unit(unit_name: str) -> int:
-    # 智能所、研究中心 取前5，其它前10
     special = ["智能所", "研究中心"]
     return 5 if any(k in str(unit_name) for k in special) else 10
 
 def safe_sheet_name(name: str) -> str:
-    # Excel sheet最长31，且不能含某些特殊字符
     name = re.sub(r"[\[\]\:\*\?\/\\]", "_", str(name))
     return name[:31] if len(name) > 31 else name
+
+def choose_excel_engine() -> str | None:
+    """
+    自动选择可用的 ExcelWriter 引擎：优先 xlsxwriter，其次 openpyxl
+    """
+    try:
+        import xlsxwriter  # noqa: F401
+        return "xlsxwriter"
+    except Exception:
+        try:
+            import openpyxl  # noqa: F401
+            return "openpyxl"
+        except Exception:
+            return None
+
+def render_tree(df_uy: pd.DataFrame, metric_col: str, metric_label: str, top_n: int):
+    """
+    在某一个（签订单位 + 年份）范围内：
+    - 先输出客商 TopN 汇总表（按 metric）
+    - 再以树状折叠展示：客商 -> 签订日期 -> 合同名称 -> 合同编号(明细)
+    """
+    # TopN 汇总
+    g = (df_uy.groupby("客商名称", as_index=False)[metric_col]
+           .sum(min_count=1)
+           .dropna(subset=[metric_col]))
+
+    if g.empty:
+        st.info(f"该范围内 {metric_label} 无可统计数据。")
+        return pd.DataFrame(columns=["客商名称", f"{metric_label}(万元)"])
+
+    g[f"{metric_label}(万元)"] = g[metric_col] / 10000
+    g = g.sort_values(metric_col, ascending=False).head(top_n).reset_index(drop=True)
+
+    show_df = g[["客商名称", f"{metric_label}(万元)"]].copy()
+    show_df[f"{metric_label}(万元)"] = show_df[f"{metric_label}(万元)"].round(2)
+
+    st.dataframe(show_df, use_container_width=True)
+
+    # 明细树
+    top_customers = g["客商名称"].tolist()
+    for cust in top_customers:
+        cust_total_w = float(g.loc[g["客商名称"] == cust, f"{metric_label}(万元)"].iloc[0])
+
+        with st.expander(f"▶ {cust}  |  {metric_label}合计：{cust_total_w:.2f} 万元", expanded=False):
+            d0 = df_uy[df_uy["客商名称"] == cust].copy()
+
+            # 日期展示 + 排序
+            if "签订日期" in d0.columns:
+                d0["_dt"] = pd.to_datetime(d0["签订日期"], errors="coerce")
+                d0 = d0.sort_values("_dt")
+                d0["日期显示"] = d0["_dt"].dt.strftime("%Y/%m/%d").fillna("未知日期")
+            else:
+                d0["日期显示"] = "未知日期"
+
+            # 日期层
+            for date_key, d_date in d0.groupby("日期显示", dropna=False):
+                date_sum_w = (d_date[metric_col].sum(skipna=True) / 10000) if metric_col in d_date else 0.0
+
+                with st.expander(f"  📅 {date_key}  |  小计：{date_sum_w:.2f} 万元", expanded=False):
+                    # 合同名称层
+                    for cname, d_cname in d_date.groupby("合同名称", dropna=False):
+                        cname_show = str(cname) if pd.notna(cname) and str(cname).strip() else "（空合同名称）"
+                        cname_sum_w = d_cname[metric_col].sum(skipna=True) / 10000
+
+                        with st.expander(f"    📄 {cname_show}  |  小计：{cname_sum_w:.2f} 万元", expanded=False):
+                            cols_show = ["合同编号", "合同名称", "合同金额", "结算金额", "完成量金额"]
+                            cols_show = [c for c in cols_show if c in d_cname.columns]
+
+                            dd = d_cname[cols_show].copy()
+
+                            # 转万元显示
+                            for c in ["合同金额", "结算金额", "完成量金额"]:
+                                if c in dd.columns:
+                                    dd[c] = (dd[c].fillna(0) / 10000).round(2)
+
+                            st.dataframe(dd, use_container_width=True)
+
+    return show_df
+
 
 # =========================
 # Upload
@@ -73,17 +149,16 @@ for f in uploaded_files:
         df = read_csv_safely(f)
         df = df.rename(columns=normalize_colname)
 
-        # 必要列
         required = ["签订单位", "客商名称", "合同编号", "合同名称", "合同金额", "结算金额", "完成量金额"]
         missing = [c for c in required if c not in df.columns]
-
         if missing:
             errors.append(f"❌ {fname} 缺少列：{', '.join(missing)}")
             continue
 
-        df = df[required + (["签订日期"] if "签订日期" in df.columns else [])].copy()
+        keep_cols = required + (["签订日期"] if "签订日期" in df.columns else [])
+        df = df[keep_cols].copy()
 
-        # 年份字段：优先用文件名年份；否则用签订日期解析
+        # 年份字段：优先文件名；否则用签订日期解析
         if year_from_name:
             df["年份"] = year_from_name
         else:
@@ -122,7 +197,7 @@ if not all_rows:
 data_all = pd.concat(all_rows, ignore_index=True)
 
 # =========================
-# UI Filters (optional)
+# UI Filters
 # =========================
 units = sorted(data_all["签订单位"].dropna().unique().tolist())
 years = sorted(data_all["年份"].dropna().unique().tolist())
@@ -139,15 +214,9 @@ if df0.empty:
     st.stop()
 
 # =========================
-# Core: group by Unit -> Year -> Customer
+# Core: Unit -> Year -> Tree Tables
 # =========================
-metrics = [
-    ("合同金额", "合同金额"),
-    ("结算金额", "结算金额"),
-    ("完成量金额", "完成量金额"),
-]
-
-# 导出缓存：每个单位-年份-指标都出一张sheet
+# 导出缓存：每个单位-年份-指标一张sheet（Top榜）
 export_sheets = {}
 
 for unit in sorted(df0["签订单位"].unique().tolist()):
@@ -160,66 +229,39 @@ for unit in sorted(df0["签订单位"].unique().tolist()):
             with st.expander(f"📅 年份：{year}", expanded=False):
                 df_uy = df_unit[df_unit["年份"] == year].copy()
 
-                # 明细数据（用于合同展开）
-                # 这里不去重：同一合同在数据里如果重复行，你可以按需去重
-                detail_cols = ["客商名称", "合同编号", "合同名称", "合同金额", "结算金额", "完成量金额"]
-                df_detail = df_uy[detail_cols].copy()
+                st.markdown("### ① 按合同金额 Top客商（树状明细）")
+                top_table_1 = render_tree(df_uy, metric_col="合同金额", metric_label="合同金额", top_n=n_top)
+                export_sheets[f"{unit}_{year}_合同金额"] = top_table_1
 
-                # 对每个指标分别做Top表
-                for metric_label, metric_col in metrics:
-                    st.subheader(f"📌 按 {metric_label} 排名（Top{n_top} 客商）")
+                st.markdown("### ② 按结算金额 Top客商（树状明细）")
+                top_table_2 = render_tree(df_uy, metric_col="结算金额", metric_label="结算金额", top_n=n_top)
+                export_sheets[f"{unit}_{year}_结算金额"] = top_table_2
 
-                    # 客商汇总
-                    g = (
-                        df_uy.groupby("客商名称", as_index=False)[metric_col]
-                        .sum(min_count=1)
-                        .rename(columns={metric_col: f"{metric_label}(元)"})
-                    )
-                    g = g.dropna(subset=[f"{metric_label}(元)"])
-                    g[f"{metric_label}(万元)"] = g[f"{metric_label}(元)"] / 10000
-                    g = g.sort_values(by=f"{metric_label}(元)", ascending=False).head(n_top).reset_index(drop=True)
-
-                    # 展示Top表
-                    show_df = g[["客商名称", f"{metric_label}(万元)"]].copy()
-                    show_df[f"{metric_label}(万元)"] = show_df[f"{metric_label}(万元)"].round(2)
-                    st.dataframe(show_df, use_container_width=True)
-
-                    # 合同明细折叠：每个Top客商一个 expander
-                    top_customers = g["客商名称"].tolist()
-                    for cust in top_customers:
-                        with st.expander(f"🔎 客商：{cust} | 查看合同明细（合同名称 + 合同编号）", expanded=False):
-                            d = df_detail[df_detail["客商名称"] == cust].copy()
-
-                            # 只展示关键信息 + 三指标（便于核对）
-                            d["合同金额"] = d["合同金额"].fillna(0)
-                            d["结算金额"] = d["结算金额"].fillna(0)
-                            d["完成量金额"] = d["完成量金额"].fillna(0)
-
-                            d_show = d[["合同编号", "合同名称", "合同金额", "结算金额", "完成量金额"]].copy()
-                            # 转万元显示更友好
-                            for c in ["合同金额", "结算金额", "完成量金额"]:
-                                d_show[c] = (d_show[c] / 10000).round(2)
-
-                            st.dataframe(d_show, use_container_width=True)
-
-                    # ============ Export sheet ============
-                    sheet_key = f"{unit}_{year}_{metric_label}"
-                    export_sheets[sheet_key] = show_df.copy()
+                st.markdown("### ③ 按完成量金额 Top客商（树状明细）")
+                top_table_3 = render_tree(df_uy, metric_col="完成量金额", metric_label="完成量金额", top_n=n_top)
+                export_sheets[f"{unit}_{year}_完成量金额"] = top_table_3
 
 st.divider()
 
 # =========================
-# Export Excel (all sheets)
+# Export Excel (engine fallback)
 # =========================
 if export_sheets:
+    engine = choose_excel_engine()
+    if not engine:
+        st.error("当前环境缺少 Excel 导出依赖：xlsxwriter 或 openpyxl。请安装其中任意一个。")
+        st.stop()
+
     output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+    with pd.ExcelWriter(output, engine=engine) as writer:
         for k, v in export_sheets.items():
-            writer_sheet = safe_sheet_name(k)
-            v.to_excel(writer, sheet_name=writer_sheet, index=False)
+            if v is None or v.empty:
+                continue
+            sheet = safe_sheet_name(k)
+            v.to_excel(writer, sheet_name=sheet, index=False)
 
     st.download_button(
-        label="📥 下载统计结果Excel（按单位_年份_指标分Sheet）",
+        label=f"📥 下载统计结果Excel（按单位_年份_指标分Sheet | engine={engine}）",
         data=output.getvalue(),
         file_name="Unit_Year_Customer_Top_Stats.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
